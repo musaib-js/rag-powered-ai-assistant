@@ -50,45 +50,50 @@ def get_qa_chain(vector_store):
 @api.route("/upload")
 class Upload(Resource):
     def post(self):
-        file = request.files["file"]
-        file_type = file.filename.split(".")[-1].lower()
+        try:
+            file = request.files["file"]
+            file_type = file.filename.split(".")[-1].lower()
 
-        if file_type not in ["pdf", "csv", "txt"]:
-            return (
-                jsonify({"error": "Invalid file type. Only PDF, CSV, and TXT allowed"}),
-                400,
-            )
+            if file_type not in ["pdf", "csv", "txt"]:
+                return (
+                    jsonify({"error": "Invalid file type. Only PDF, CSV, and TXT allowed"}),
+                    400,
+                )
 
-        document_id = str(uuid.uuid4())
-        file_path = os.path.join(UPLOAD_FOLDER, f"{document_id}.{file_type}")
-        file.save(file_path)
+            document_id = str(uuid.uuid4())
+            file_path = os.path.join(UPLOAD_FOLDER, f"{document_id}.{file_type}")
+            file.save(file_path)
 
-        # Upload to Google Drive
-        file_id = upload_to_google_drive(file_path, file.filename)
+            # Upload to Google Drive
+            file_id = upload_to_google_drive(file_path, file.filename)
 
-        # Store metadata in MongoDB
-        document_data = {
-            "file_name": file.filename,
-            "file_id": file_id,
-            "file_type": file_type,
-            "document_id": document_id,
-            "messages": [],
-        }
-        documents_collection.insert_one(document_data)
-
-        documents = load_documents(file_path, file_type)
-        index_path = os.path.join(INDEX_FOLDER, document_id)
-        create_vector_store(documents, index_path)
-
-        os.remove(file_path)
-
-        return jsonify(
-            {
-                "message": "File uploaded and indexed successfully",
+            # Store metadata in MongoDB
+            document_data = {
+                "file_name": file.filename,
+                "file_id": file_id,
+                "file_type": file_type,
                 "document_id": document_id,
+                "messages": [],
             }
-        )
+            documents_collection.insert_one(document_data)
 
+            documents = load_documents(file_path, file_type)
+            index_path = os.path.join(INDEX_FOLDER, document_id)
+            create_vector_store(documents, index_path)
+
+            os.remove(file_path)
+
+            return jsonify(
+                {
+                    "message": "File uploaded and indexed successfully",
+                    "document_id": document_id,
+                }
+            )
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        finally:
+            if os.path.exists(file_path):
+                os.remove(file_path)
 
 @api.route("/query")
 class Query(Resource):
