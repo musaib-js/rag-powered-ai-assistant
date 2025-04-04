@@ -22,7 +22,7 @@ class UploadTestUser(HttpUser):
             files = {"file": (file_name, f, "application/octet-stream")}
             response = self.client.post("/upload", files=files)
 
-        os.remove(file_path)  # Cleanup
+        os.remove(file_path)  
 
         assert response.status_code == 200, f"Upload failed: {response.text}"
         assert "document_id" in response.json(), "document_id missing in response"
