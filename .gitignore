@@ -2,6 +2,5 @@
 /.pytest_cache/
 /env/
 /.env
-/credentials.json
 /.DS_Store
 /.idea/
