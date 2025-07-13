@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from langchain.chains.retrieval_qa.base import RetrievalQA
 from langchain_openai import OpenAI
 import os
 import uuid
@@ -8,9 +7,8 @@ from dotenv import load_dotenv
 from flask_restx import Api, Resource
 from request_validators import register_models
 import pymongo
-from googledrive.google_drive_handler import upload_to_google_drive
 from doc_loaders import load_documents
-from vectorisation import create_vector_store, load_vector_store
+from pinecone_vec import create_vector_store, query_vector_store
 from datetime import datetime
 import time
 
@@ -26,7 +24,6 @@ api = Api(
 )
 CORS(app)
 
-
 MONGO_URI = os.getenv("MONGO_URI")
 mongo_client = pymongo.MongoClient(MONGO_URI)
 db = mongo_client["document_store"]
@@ -34,18 +31,11 @@ documents_collection = db["documents"]
 logs_collection = db["logs"]
 
 UPLOAD_FOLDER = "uploads"
-INDEX_FOLDER = "indexes"
-
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(INDEX_FOLDER, exist_ok=True)
 
 upload_parser, upload_model, query_model = register_models(api)
 
-
-def get_qa_chain(vector_store):
-    retriever = vector_store.as_retriever()
-    return RetrievalQA.from_chain_type(llm=OpenAI(), retriever=retriever)
-
+llm = OpenAI()
 
 @api.route("/upload")
 class Upload(Resource):
@@ -64,13 +54,9 @@ class Upload(Resource):
             file_path = os.path.join(UPLOAD_FOLDER, f"{document_id}.{file_type}")
             file.save(file_path)
 
-            # Upload to Google Drive
-            file_id = upload_to_google_drive(file_path, file.filename)
-
             # Store metadata in MongoDB
             document_data = {
                 "file_name": file.filename,
-                "file_id": file_id,
                 "file_type": file_type,
                 "document_id": document_id,
                 "messages": [],
@@ -78,8 +64,7 @@ class Upload(Resource):
             documents_collection.insert_one(document_data)
 
             documents = load_documents(file_path, file_type)
-            index_path = os.path.join(INDEX_FOLDER, document_id)
-            create_vector_store(documents, index_path)
+            create_vector_store(documents, document_id)
 
             os.remove(file_path)
 
@@ -95,40 +80,33 @@ class Upload(Resource):
             if os.path.exists(file_path):
                 os.remove(file_path)
 
+
 @api.route("/query")
 class Query(Resource):
     @api.expect(query_model)
     def post(self):
         file_id = request.json["file_id"]
+        query_text = request.json["query"]
+
         document_data = documents_collection.find_one({"file_id": file_id})
         if not document_data:
             return {"error": "Document not found"}, 404
 
-        index_path = os.path.join(INDEX_FOLDER, document_data["document_id"])
-        vector_store = load_vector_store(index_path)
-        if vector_store is None:
-            return {"error": "No index found for this document"}, 400
+        matches = query_vector_store(document_data["document_id"], query_text)
 
-        data = request.json
-        query_text = data["query"]
+        if not matches:
+            return {"response": "No relevant documents found."}
 
-        start_time = time.time()  # Start time for latency tracking
+        # Concatenate top chunks as context
+        context = "\n\n".join([match["metadata"]["text"] for match in matches])
 
-        qa_chain = get_qa_chain(vector_store)
-        response = qa_chain.invoke(query_text)
+        # Ask LLM
+        start_time = time.time()
+        prompt = f"Answer the question based on the context below:\n\nContext:\n{context}\n\nQuestion: {query_text}"
+        result = llm.invoke(prompt)
+        response_time = time.time() - start_time
 
-        response_time = time.time() - start_time  # Calculate response time
-
-        # Create tracking logs
-        log_entry = {
-            "file_id": file_id,
-            "query": query_text,
-            "response": response,
-            "timestamp": time.time(),
-            "response_time": response_time,
-            "file_name": document_data["file_name"],
-        }
-
+        # Store messages & logs
         message_1 = {
             "from": "user",
             "message": query_text,
@@ -136,7 +114,7 @@ class Query(Resource):
         }
         message_2 = {
             "from": "assistant",
-            "message": response["result"],
+            "message": result,
             "timestamp": datetime.now().isoformat(),
         }
 
@@ -145,9 +123,16 @@ class Query(Resource):
             {"$push": {"messages": {"$each": [message_1, message_2]}}},
         )
 
-        logs_collection.insert_one(log_entry)
+        logs_collection.insert_one({
+            "file_id": file_id,
+            "query": query_text,
+            "response": {"result": result},
+            "timestamp": time.time(),
+            "response_time": response_time,
+            "file_name": document_data["file_name"],
+        })
 
-        return {"response": response["result"]}
+        return {"response": result}
 
 
 @api.route("/list-files")
@@ -180,7 +165,6 @@ class LoadChat(Resource):
 @api.route("/query-volume")
 class QueryVolume(Resource):
     def get(self):
-        """Returns the number of queries made per day"""
         pipeline = [
             {
                 "$project": {
@@ -200,7 +184,6 @@ class QueryVolume(Resource):
             },
             {"$sort": {"_id": 1}}
         ]
-
         result = list(logs_collection.aggregate(pipeline))
         return jsonify({"query_volume": result})
 
@@ -208,7 +191,6 @@ class QueryVolume(Resource):
 @api.route("/latency-success")
 class LatencySuccess(Resource):
     def get(self):
-        """Returns LLM latency and success rate per date"""
         pipeline = [
             {
                 "$project": {
@@ -235,7 +217,6 @@ class LatencySuccess(Resource):
         ]
 
         result = list(logs_collection.aggregate(pipeline))
-
         response_data = [
             {
                 "date": entry["_id"],
@@ -248,15 +229,12 @@ class LatencySuccess(Resource):
             }
             for entry in result
         ]
-
         return jsonify(response_data)
-
 
 
 @api.route("/top-queries")
 class TopQueries(Resource):
     def get(self):
-        """Returns the most frequently queried documents/questions"""
         pipeline = [
             {"$group": {"_id": "$query", "count": {"$sum": 1}}},
             {"$sort": {"count": -1}},
@@ -269,7 +247,6 @@ class TopQueries(Resource):
 @api.route("/top-documents")
 class TopDocuments(Resource):
     def get(self):
-        """Returns the most queried documents"""
         pipeline = [
             {"$group": {"_id": "$file_id", "query_count": {"$sum": 1}}},
             {"$sort": {"query_count": -1}},
