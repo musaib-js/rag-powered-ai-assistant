@@ -200,4 +200,4 @@ with gr.Blocks() as demo:
         )
 
 # ---- Launch ----
-demo.launch()
+demo.launch(share=True)
